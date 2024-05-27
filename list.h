@@ -1,4 +1,5 @@
 //Created by Yury Vazhenin
+
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -53,19 +54,6 @@ public:
     }
 
     void deallocate (T*, size_t) {}
-
-    template<typename... Args>
-    void construct (T* ptr, const Args&... args) {
-        new (ptr) T(args...);
-    }
-
-    void destroy (T* ptr) {
-        ptr->~T();
-    }
-
-    StackAllocator select_on_container_copy_construction() const {
-        return StackAllocator(*storage);
-    }
 
     template<typename U, size_t M>
     StackAllocator& operator=(const StackAllocator<U, M>& alloc) {
@@ -139,7 +127,7 @@ class List {
         }
 
         pointer operator->() const {
-            return &(ptr->value);
+            return &(*this);
         }
 
         base_iterator& operator++() {
@@ -176,22 +164,26 @@ public:
 
     List() : sz(0) {}
 
-    List (size_t sz) : sz(sz) {
-        fill_default_value();
+    List (size_t sz_) : List() {
+        sz = sz_;
+        fill_list();
     }
 
-    List (size_t sz, const T& value) : sz(sz) {
-        fill_with_value(value);
+    List (size_t sz_, const T& value) : List() {
+        sz = sz_;
+        fill_list(value);
     }
 
     List(const Alloc& alloc) : sz(0), alloc(alloc) {}
 
-    List (size_t sz, const Alloc& allocator) : sz(sz), alloc(allocator) {
-        fill_default_value();
+    List (size_t sz_, const Alloc& allocator) : List(allocator) {
+        sz = sz_;
+        fill_list();
     }
 
-    List (size_t sz, const T& value, const Alloc& alloc) : sz(sz), alloc(alloc) {
-        fill_with_value(value);
+    List (size_t sz_, const T& value, const Alloc& allocator) : List(allocator){
+        sz = sz_;
+        fill_list(value);
     }
 
     bool empty() const {
@@ -199,18 +191,11 @@ public:
     }
 
     void push_back (const T& value) {
-        Node* place = add_node_with_value(fake.prev, alloc, value);
-        fake.prev = place;
-        place->next = &fake;
-        ++sz;
+        insert(end(), value);
     }
 
     void push_front (const T& value) {
-        BaseNode* front = fake.next;
-        Node* place = add_node_with_value(&fake, alloc, value);
-        place->next = front;
-        front->prev = place;
-        ++sz;
+        insert(begin(), value);
     }
 
     void pop_back() {
@@ -227,7 +212,7 @@ public:
 
     void insert (const_iterator place, const T& value) {
         BaseNode* next_node = place.ptr;
-        Node* new_node = add_node_with_value(place.ptr->prev, alloc, value);
+        Node* new_node = add_node(place.ptr->prev, alloc, value);
         new_node->next = next_node;
         next_node->prev = new_node;
         ++sz;
@@ -289,49 +274,40 @@ public:
         return const_reverse_iterator(const_cast<BaseNode*>(&fake));
     }
 
-    List (const List& other) : fake(), sz(other.sz), alloc(AllocTraits::select_on_container_copy_construction(other.alloc)) {
-        if (other.sz == 0)
-            return;
-        const_iterator current_other = other.begin();
-        BaseNode* previous_node = &fake;
-        size_t index = 0;
-        try {
-            for (index = 0; index < sz; ++index, ++current_other) {
-                Node *current_node = add_node_with_value(previous_node, alloc, *current_other);
-                previous_node = current_node;
-            }
-        } catch (...) {
-            clear_prefix(fake, index, alloc);
-            throw;
+    List (const List& other) : List(AllocTraits::select_on_container_copy_construction(other.alloc)) {
+        for (const auto& elem : other) {
+            push_back(elem);
         }
-        previous_node->next = &fake;
-        fake.prev = previous_node;
+    }
+
+
+    void swap(List& other) {
+        std::swap(fake, other.fake);
+        std::swap(sz, other.sz);
+        std::swap(alloc, other.alloc);
+        if (other.sz != 0) {
+            other.fake.next->prev = &other.fake;
+            other.fake.prev->next = &other.fake;
+        } else {
+            other.fake.next = other.fake.prev = &other.fake;
+        }
+        if (sz != 0) {
+            fake.next->prev = &fake;
+            fake.prev->next = &fake;
+        } else {
+            fake.next = fake.prev = &fake;
+        }
     }
 
     List& operator=(const List& other) {
-        size_t new_sz = other.sz;
-        BaseNode new_fake = BaseNode();
-        AllocType new_alloc = (AllocTraits::propagate_on_container_copy_assignment::value ? other.alloc : alloc);
-        const_iterator current_other = other.begin();
-        BaseNode* previous_node = &new_fake;
-        size_t index = 0;
-        try {
-            for (index = 0; index < new_sz; ++index, ++current_other) {
-                Node *current_node = add_node_with_value(previous_node, new_alloc, *current_other);
-                previous_node = current_node;
-            }
-        } catch (...) {
-            clear_prefix(new_fake, index, new_alloc);
-            throw;
+        if (this == &other)
+            return *this;
+        List new_list(AllocTraits::propagate_on_container_copy_assignment::value ? other.alloc : alloc);
+        for (const auto& elem : other) {
+            new_list.push_back(elem);
         }
-        previous_node->next = &new_fake;
-        new_fake.prev = previous_node;
         clear();
-        fake.prev = new_fake.prev;
-        fake.next = new_fake.next;
-        fake.next->prev = fake.prev->next = &fake;
-        alloc = new_alloc;
-        sz = new_sz;
+        swap(new_list);
         return *this;
     }
 
@@ -345,10 +321,11 @@ private:
             pop_back();
     }
 
-    Node* add_node_with_value (BaseNode* previous, AllocType& alloc_for_add, const T& value) {
+    template<typename... Args>
+    Node* add_node(BaseNode* previous, AllocType& alloc_for_add, Args&... args) {
         Node* new_node = AllocTraits::allocate(alloc_for_add, 1);
         try {
-            AllocTraits::construct(alloc_for_add, new_node, value);
+            AllocTraits::construct(alloc_for_add, new_node, args...);
         } catch (...) {
             AllocTraits::deallocate(alloc_for_add, new_node, 1);
             throw;
@@ -358,69 +335,17 @@ private:
         return new_node;
     }
 
-    Node* add_default_node (BaseNode* previous, AllocType& alloc_for_add) {
-        Node* new_node = AllocTraits::allocate(alloc_for_add, 1);
-        try {
-            AllocTraits::construct(alloc_for_add, new_node);
-        } catch (...) {
-            AllocTraits::deallocate(alloc_for_add, new_node, 1);
-            throw;
-        }
-        previous->next = new_node;
-        new_node->prev = previous;
-        return new_node;
-    }
-
-    void clear_prefix (BaseNode& start_node, size_t count, AllocType& alloc_for_clear) {
-        if (count == 0) {
-            start_node = BaseNode();
-            return;
-        }
-        Node* current_node = static_cast<Node*>(start_node.next);
-        Node* next_node = current_node;
-        for (size_t index = 0; index < count; ++index) {
-            if (index != count - 1) {
-                next_node = static_cast<Node*>(current_node->next);
-            }
-            AllocTraits::destroy(alloc_for_clear, current_node);
-            AllocTraits::deallocate(alloc_for_clear, current_node, 1);
-            if (index != count - 1) {
-                current_node = next_node;
-            }
-        }
-        start_node = BaseNode();
-    }
-
-    void fill_with_value(const T& value) {
+    template<typename... Args>
+    void fill_list(Args&... args) {
         BaseNode* previous_node = &fake;
-        size_t index = 0;
-        try {
-            for (index = 0; index < sz; ++index) {
-                Node *current_node = add_node_with_value(previous_node, alloc, value);
-                previous_node = current_node;
-            }
-        } catch (...) {
-            clear_prefix(fake, index, alloc);
-            throw;
+        size_t count = sz;
+        sz = 0;
+        for (; sz < count; ++sz) {
+            Node *current_node = add_node(previous_node, alloc, args...);
+            previous_node = current_node;
+            fake.prev = current_node;
+            current_node->next = &fake;
         }
-        previous_node->next = &fake;
-        fake.prev = previous_node;
-    }
-
-    void fill_default_value() {
-        BaseNode* previous_node = &fake;
-        size_t index = 0;
-        try {
-            for (index = 0; index < sz; ++index) {
-                Node *current_node = add_default_node(previous_node, alloc);
-                previous_node = current_node;
-            }
-        } catch (...) {
-            clear_prefix(fake, index, alloc);
-            throw;
-        }
-        previous_node->next = &fake;
-        fake.prev = previous_node;
     }
 
     void pop_node (BaseNode* ptr) {
